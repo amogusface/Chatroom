@@ -1,0 +1,357 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  onAuthStateChanged, 
+  signInWithPopup, 
+  GoogleAuthProvider, 
+  signOut,
+  signInWithCustomToken,
+  signInAnonymously
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  onSnapshot, 
+  addDoc 
+} from 'firebase/firestore';
+import { Send, LogOut, User, MessageCircle, AlertCircle } from 'lucide-react';
+
+// --- Firebase Initialization ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-chat-app';
+
+export default function App() {
+  // Application States
+  const [user, setUser] = useState(null);
+  const [username, setUsername] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  
+  // Chat States
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState('');
+  const messagesEndRef = useRef(null);
+
+  // --- 1. Authentication Setup ---
+  useEffect(() => {
+    // Platform specific auth initialization
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          // Fallback, aber wir fordern später den Google Login an
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth init error:", err);
+      }
+    };
+    initAuth();
+
+    // Listen to auth state changes
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      
+      // Wenn ein echter Nutzer eingeloggt ist (nicht anonym), lade den Benutzernamen
+      if (currentUser && !currentUser.isAnonymous) {
+        try {
+          const profileRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'profile', 'data');
+          const profileSnap = await getDoc(profileRef);
+          if (profileSnap.exists() && profileSnap.data().username) {
+            setUsername(profileSnap.data().username);
+          } else {
+            setUsername(''); // Muss noch gesetzt werden
+          }
+        } catch (err) {
+          console.error("Fehler beim Laden des Profils:", err);
+        }
+      } else {
+        setUsername('');
+      }
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // --- 2. Chat Data Subscription ---
+  useEffect(() => {
+    // Nur abonnieren, wenn der Nutzer eingeloggt ist und einen Namen hat
+    if (!user || user.isAnonymous || !username) return;
+
+    const messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+    
+    const unsubscribe = onSnapshot(messagesRef, (snapshot) => {
+      const msgs = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      
+      // Sortieren im Client (Vorgabe für diese Umgebung)
+      msgs.sort((a, b) => a.timestamp - b.timestamp);
+      setMessages(msgs);
+    }, (err) => {
+      console.error("Fehler beim Laden der Nachrichten:", err);
+      setError("Verbindung zum Chatroom unterbrochen.");
+    });
+
+    return () => unsubscribe();
+  }, [user, username]);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // --- Actions ---
+  const handleGoogleLogin = async () => {
+    setError('');
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      console.error("Login Error:", err);
+      setError("Google Login fehlgeschlagen. Bitte versuche es erneut.");
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setUsername('');
+    } catch (err) {
+      console.error("Logout Error:", err);
+    }
+  };
+
+  const saveUsername = async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const chosenName = formData.get('username').trim();
+    
+    if (!chosenName || !user) return;
+    
+    try {
+      setLoading(true);
+      const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data');
+      await setDoc(profileRef, { username: chosenName });
+      setUsername(chosenName);
+      setLoading(false);
+    } catch (err) {
+      console.error("Profil speichern Error:", err);
+      setError("Fehler beim Speichern des Benutzernamens.");
+      setLoading(false);
+    }
+  };
+
+  const sendMessage = async (e) => {
+    e.preventDefault();
+    if (!newMessage.trim() || !user || !username) return;
+
+    const messageText = newMessage.trim();
+    setNewMessage(''); // UI sofort leeren für besseres Gefühl
+
+    try {
+      const messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+      await addDoc(messagesRef, {
+        text: messageText,
+        senderId: user.uid,
+        senderName: username,
+        timestamp: Date.now()
+      });
+    } catch (err) {
+      console.error("Senden Error:", err);
+      setError("Nachricht konnte nicht gesendet werden.");
+      setNewMessage(messageText); // Bei Fehler Text zurückgeben
+    }
+  };
+
+  // --- Renders ---
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
+      </div>
+    );
+  }
+
+  // State 1: Login Screen (Kein Nutzer oder nur anonym eingeloggt)
+  if (!user || user.isAnonymous) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-indigo-100 to-purple-100 flex items-center justify-center p-4">
+        <div className="bg-white max-w-md w-full rounded-2xl shadow-xl p-8 text-center">
+          <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <MessageCircle className="w-8 h-8 text-indigo-600" />
+          </div>
+          <h1 className="text-3xl font-bold text-gray-900 mb-2">Gemeinsamer Chat</h1>
+          <p className="text-gray-500 mb-8">Melde dich an, um mit allen online zu chatten.</p>
+          
+          {error && (
+            <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2 text-sm text-left">
+              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              {error}
+            </div>
+          )}
+
+          <button 
+            onClick={handleGoogleLogin}
+            className="w-full bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 font-medium py-3 px-4 rounded-xl flex items-center justify-center gap-3 transition-colors shadow-sm"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+            </svg>
+            Anmelden mit Google
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // State 2: Username wählen
+  if (!username) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-indigo-100 to-purple-100 flex items-center justify-center p-4">
+        <div className="bg-white max-w-md w-full rounded-2xl shadow-xl p-8">
+          <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <User className="w-8 h-8 text-purple-600" />
+          </div>
+          <h2 className="text-2xl font-bold text-center text-gray-900 mb-2">Wie möchtest du heißen?</h2>
+          <p className="text-center text-gray-500 mb-6">Wähle einen Benutzernamen für den Chatroom.</p>
+          
+          {error && (
+            <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2 text-sm">
+              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              {error}
+            </div>
+          )}
+
+          <form onSubmit={saveUsername} className="space-y-4">
+            <div>
+              <input 
+                type="text" 
+                name="username"
+                required
+                maxLength={20}
+                placeholder="Dein Benutzername"
+                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-shadow"
+              />
+            </div>
+            <button 
+              type="submit"
+              className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3 px-4 rounded-xl transition-colors shadow-md"
+            >
+              Speichern & Beitreten
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // State 3: Chatroom
+  return (
+    <div className="min-h-screen bg-gray-100 flex flex-col items-center p-0 sm:p-4">
+      <div className="w-full max-w-4xl bg-white sm:rounded-2xl shadow-xl overflow-hidden flex flex-col h-[100dvh] sm:h-[90vh]">
+        
+        {/* Header */}
+        <div className="bg-indigo-600 p-4 text-white flex justify-between items-center shadow-md z-10">
+          <div className="flex items-center gap-3">
+            <div className="bg-white/20 p-2 rounded-lg">
+              <MessageCircle className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="font-bold text-lg leading-tight">Gemeinsamer Chatroom</h1>
+              <p className="text-indigo-200 text-xs">Angemeldet als <span className="font-medium text-white">{username}</span></p>
+            </div>
+          </div>
+          <button 
+            onClick={handleLogout}
+            className="p-2 hover:bg-white/10 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium"
+            title="Abmelden"
+          >
+            <span className="hidden sm:inline">Abmelden</span>
+            <LogOut className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Error Banner */}
+        {error && (
+          <div className="bg-red-50 text-red-600 p-2 text-center text-sm font-medium border-b border-red-100">
+            {error}
+            <button onClick={() => setError('')} className="ml-2 underline">Ausblenden</button>
+          </div>
+        )}
+
+        {/* Messages Area */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-[#f8f9fa]">
+          {messages.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-3">
+              <MessageCircle className="w-12 h-12 opacity-20" />
+              <p>Noch keine Nachrichten. Schreib die Erste!</p>
+            </div>
+          ) : (
+            messages.map((msg) => {
+              const isMe = msg.senderId === user.uid;
+              const timeString = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+              return (
+                <div key={msg.id} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+                  {!isMe && (
+                    <span className="text-xs text-gray-500 mb-1 ml-1 font-medium">
+                      {msg.senderName}
+                    </span>
+                  )}
+                  <div 
+                    className={`max-w-[75%] px-4 py-2.5 rounded-2xl relative shadow-sm ${
+                      isMe 
+                        ? 'bg-indigo-600 text-white rounded-tr-sm' 
+                        : 'bg-white border border-gray-100 text-gray-800 rounded-tl-sm'
+                    }`}
+                  >
+                    <p className="break-words leading-relaxed">{msg.text}</p>
+                    <span className={`text-[10px] mt-1 block text-right ${isMe ? 'text-indigo-200' : 'text-gray-400'}`}>
+                      {timeString}
+                    </span>
+                  </div>
+                </div>
+              );
+            })
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Input Area */}
+        <div className="bg-white p-4 border-t border-gray-100">
+          <form onSubmit={sendMessage} className="flex gap-2 relative">
+            <input
+              type="text"
+              value={newMessage}
+              onChange={(e) => setNewMessage(e.target.value)}
+              placeholder="Schreibe eine Nachricht..."
+              className="flex-1 bg-gray-50 border border-gray-200 text-gray-800 px-4 py-3 rounded-full outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all pr-12"
+              maxLength={500}
+            />
+            <button
+              type="submit"
+              disabled={!newMessage.trim()}
+              className="absolute right-1 top-1 bottom-1 aspect-square flex items-center justify-center bg-indigo-600 text-white rounded-full hover:bg-indigo-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+            >
+              <Send className="w-5 h-5 ml-0.5" />
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
